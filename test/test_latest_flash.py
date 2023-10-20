@@ -1,7 +1,7 @@
 import torch
 import pytest
-from transformer_nuggets.flash import BiasMode, build_alibi_mask, latest_attention
-
+from transformer_nuggets.flash import BiasMode, build_alibi_mask, latest_attention, build_causal_attention_mask, build_causal_mask
+import time
 
 @pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(4, 8, 128, 16)])
 #@pytest.mark.parametrize("",)
@@ -47,4 +47,24 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.floa
     tri_out.half()
 
     torch.testing.assert_close(ref_out, tri_out, atol=5.5e-2, rtol=0)
+
+@pytest.mark.parametrize("N_CTX", [128, 256, 1024, 2048, 4096, 8192, 16384])
+def test_mask(N_CTX, ):
+    torch.manual_seed(2020)
+
+    print(f"{N_CTX=}")
+    start =  time.perf_counter()
+    driss_ref = build_causal_mask(N_CTX, N_CTX)
+    stop = time.perf_counter()
+    dtime = round(stop-start, 5)
+    start =  time.perf_counter()
+    less_ref = build_causal_attention_mask(N_CTX, N_CTX)
+    stop = time.perf_counter()
+    ltime = round(stop-start, 5)
+    print(f"{dtime=}, {ltime=}")
+
+    torch.testing.assert_close(driss_ref, less_ref, atol=5.5e-2, rtol=0)
+
+
+
 

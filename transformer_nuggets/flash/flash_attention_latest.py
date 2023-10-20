@@ -12,6 +12,45 @@ import torch
 
 from triton import cdiv, jit
 from triton import language as tl
+import triton 
+import enum 
+
+def build_causal_mask(seq_len_q, seq_len_kv):
+    temp_mask = (
+        torch.ones((seq_len_q, seq_len_kv))
+        .tril_()
+        .bool()
+    )
+    mask = torch.zeros_like(temp_mask, dtype=torch.float32)
+    mask.masked_fill_(temp_mask.logical_not(), float("-inf"))
+    return mask
+
+def build_causal_attention_mask(seq_len_q: int, seq_len_kv: int, num_heads: int=0) -> torch.Tensor:
+        """builds a generic causal attention mask"""
+        causal_mask = torch.triu(
+            torch.ones((seq_len_q, seq_len_kv,), dtype=torch.float32) * float("-inf"), diagonal=1
+        )
+        #attn_mask = causal_mask.repeat(num_heads, 1, 1)
+        return causal_mask
+
+
+@triton.jit
+def rel_attention_triton(cur, m, n, head_num, num_heads):
+    bias = n - m
+    cur = cur + bias
+    return cur
+
+class BiasMode(enum.Enum):
+    none = 0
+    rel_pos = 1
+    alibi = 2
+
+@triton.jit
+def alibi_attention_triton(cur, m, n, head_num: int, num_heads: int):
+    alibi_scale = tl.math.exp2(-((head_num + 1) * 8.0 / num_heads))
+    bias = n - m
+    cur = cur + (alibi_scale * bias)
+    return cur
 
 
 @jit
@@ -358,11 +397,14 @@ def _bwd_kernel(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, sequence_parallel=False):
+    
+    def forward(ctx, q, k, v, causal, sm_scale, bias_choice: BiasMode = BiasMode.none, debug_mask: bool = False, sequence_parallel=False):
         # only support for Ampere now
         capability = torch.cuda.get_device_capability()
         if capability[0] < 8:
             raise RuntimeError("Flash attention currently only supported for compute capability >= 80")
+        
+        batch_size, num_heads, seq_len_qv, d_head = q.shape
         BLOCK_M = 128
         BLOCK_N = 64
         # shape constraints
@@ -372,11 +414,18 @@ class _attention(torch.autograd.Function):
         o = torch.empty_like(q)
         grid = (cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
         L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+
+        scratch_space = None
+        if debug_mask:
+            scratch_space = torch.zeros((batch_size, num_heads, seq_len_qv, seq_len_qv), device=q.device, dtype=torch.float32)
+        
         num_warps = 4 if Lk <= 64 else 8
+
         _fwd_kernel[grid](
             q, k, v, sm_scale,
             L,
             o,
+            scratch_space,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -385,6 +434,8 @@ class _attention(torch.autograd.Function):
             q.shape[0] * q.shape[1] * q.shape[2],
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
             IS_CAUSAL=causal,
+            BIAS_CHOICE=bias_choice.value,
+            DEBUG_MASK=debug_mask,
             num_warps=num_warps,
             num_stages=4)
 
