@@ -50,19 +50,21 @@ def alibi_attention_triton(cur, m, n, head_num: int, num_heads: int):
     alibi_scale = 1 # tl.math.exp2(-((head_num + 1) * 8.0 / num_heads))
     #tl.device_print("alibi scale ", alibi_scale)
     bias = n-m
-    tl.device_print("m, n, bias ", m, n, bias)
+    
+    #tl.device_print("bias ",bias)
     #breakpoint()
     #tl.device_print("m, n, head_num ",m, n, head_num)
-    alibi_mask = alibi_scale * bias
+    #alibi_mask = alibi_scale * bias
     #breakpoint()
     #tl.device_print("alibi mask ", alibi_mask)
     #tl.device_print("m ", m)
     #tl.device_print("alibi_heads ", alibi_scale)
-    cur = cur + alibi_mask
+    #cur = cur + bias # alibi_mask
     #breakpoint()
-    return cur
+    return bias
 
-
+'''
+original fwd 
 @jit
 def _fwd_kernel(
     Q, K, V, sm_scale,
@@ -140,14 +142,14 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         tl.device_print("block_m, block_n ", BLOCK_M, BLOCK_N)
         if IS_CAUSAL:
-            tl.device_print("qk causal ", qk)
+            #tl.device_print("qk causal ", qk)
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, -1.0e6)
-            tl.device_print("qk after where ", qk)
+            #tl.device_print("qk after where ", qk)
         qk += tl.dot(q, k, allow_tf32=True)
         # ~~~~~~~~~~~~~ Mask work ~~~~~~~~~~~~~~ 
         if BIAS_CHOICE == BiasMode.alibi:
             qk = alibi_attention_triton(qk, offs_m[:,None], (start_n + offs_n[None,:]),
-                                        off_hz % H, H)
+                                        off_hz % H, H, start_m, start_n)
         elif BIAS_CHOICE == BiasMode.rel_pos:
             qk = rel_pos_attention_triton(qk, offs_m[:,None], (start_n + offs_n[None,:]),
                                           off_hz % H, H)
@@ -172,6 +174,9 @@ def _fwd_kernel(
         # update pointers
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        # ---------- Debug, Mask Advance -----------
+        if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
+            mask_block_ptr = tl.advance(mask_block_ptr, (0,BLOCK_N))
     # write back l and m
     acc = acc / l_i[:, None]
     l_ptrs = L + off_hz * N_CTX + offs_m
@@ -187,7 +192,341 @@ def _fwd_kernel(
     )
     # O_ptrs = Out + qvk_offset + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
     tl.store(O_block_ptr, acc.to(K.dtype.element_ty))
+'''
 
+
+@triton.jit
+def _attn_fwd_inner(
+    acc, l_i, m_i, q,
+    K_block_ptr, V_block_ptr,
+    start_m, qk_scale, off_h, H, 
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STAGE: tl.constexpr,
+    offs_m: tl.constexpr,
+    offs_n: tl.constexpr,
+    N_CTX: tl.constexpr,
+    mask_block_ptr,
+):
+    # range of values handled by this stage
+    if STAGE == 1:
+        lo, hi = 0, start_m * BLOCK_M
+    elif STAGE == 2:
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+    # causal = False
+    else:
+        lo, hi = 0, N_CTX
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    # loop over k, v and update accumulator
+    for start_n in range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        k = tl.load(K_block_ptr)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, k)
+        if STAGE == 2:
+            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk -= m_ij[:, None]
+            # ~~~~~~~~~~ mask work ~~~~~~~~~~~~~
+            res = alibi_attention_triton(qk, offs_m[:, None], (start_n + offs_n[None, :]), off_h, H)
+            #mask = qk - tl.dot(q,k)
+            #mask -= m_ij[:, None]
+            mask = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), res, -1.0e6,)
+            tl.store(mask_block_ptr, mask)
+            # ~~~~~~~~~ end mask work ~~~~~~~~~~~
+
+        else:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        # -- update m_i and l_i
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        # -- update output accumulator --
+        acc = acc * alpha[:, None]
+        # update acc
+        v = tl.load(V_block_ptr)
+        acc += tl.dot(p.to(tl.float16), v)
+        # update m_i and l_i
+        m_i = m_ij
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        # ~~~~~~~~~ mask advance ~~~~~~~ 
+        if STAGE ==2:
+            mask_block_ptr = tl.advance(mask_block_ptr, (0, BLOCK_N))
+
+    return acc, l_i, m_i
+
+@triton.jit
+def _attn_fwd(
+    Q, K, V, sm_scale, M, Out, mask_scratch_space,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vk, stride_vn,
+    stride_oz, stride_oh, stride_om, stride_on,
+    Z, H,
+    N_CTX: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STAGE: tl.constexpr,
+    is_causal: tl.constexpr,
+    bias_choice: tl.constexpr,
+    debug_mask: tl.constexpr
+
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+
+    # block pointers
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_qm, stride_qk),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_vk, stride_vn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(BLOCK_DMODEL, N_CTX),
+        strides=(stride_kk, stride_kn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_DMODEL, BLOCK_N),
+        order=(0, 1),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        base=Out + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_om, stride_on),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+
+    #if debug_mask and bias_choice != BiasMode.none:
+    mask_block_ptr = tl.make_block_ptr(
+        base = mask_scratch_space + off_hz*N_CTX*N_CTX,
+        shape=(N_CTX, N_CTX),
+        strides=(N_CTX, 1),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_N),
+        order=(1, 0)
+    )
+    # initialize offsets
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    # initialize pointer to m and l
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    # load scales
+    qk_scale = sm_scale
+    qk_scale *= 1.44269504  # 1/log(2)
+    # load q: it will stay in SRAM throughout
+    q = tl.load(Q_block_ptr)
+    # stage 1: off-band
+    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
+    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
+    if STAGE & 1:
+        acc, l_i, m_i = _attn_fwd_inner(
+            acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
+            start_m, qk_scale, off_h, H, 
+            BLOCK_M, BLOCK_DMODEL, BLOCK_N,
+            4 - STAGE, offs_m, offs_n, N_CTX, mask_block_ptr,
+        )
+    # stage 2: on-band
+    if STAGE & 2:
+        # barrier makes it easier for compielr to schedule the
+        # two loops independently
+        tl.debug_barrier()
+        acc, l_i, m_i = _attn_fwd_inner(
+            acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
+            start_m, qk_scale, off_h, H,
+            BLOCK_M, BLOCK_DMODEL, BLOCK_N,
+            2, offs_m, offs_n, N_CTX, mask_block_ptr, 
+        )
+    # epilogue
+    m_i += tl.math.log2(l_i)
+    acc = acc / l_i[:, None]
+    m_ptrs = M + off_hz * N_CTX + offs_m
+    tl.store(m_ptrs, m_i)
+    tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+
+
+class _attention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, causal, sm_scale, bias_choice: BiasMode = BiasMode.none, debug_mask: bool = True,):
+        # shape constraints
+        Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+        assert Lq == Lk and Lk == Lv
+        assert Lk in {16, 32, 64, 128}
+        o = torch.empty_like(q)
+        BLOCK_M = 128
+        BLOCK_N = 64 if Lk <= 64 else 32
+        num_stages = 4 if Lk <= 64 else 3
+        num_warps = 4
+        stage = 3 if causal else 1
+        # Tuning for H100
+        if torch.cuda.get_device_capability()[0] == 9:
+            num_warps = 8
+            num_stages = 7 if Lk >= 64 else 3
+
+        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        # ~~~~~~~~` mask debugging ` ~~~~~~~~~~~~~~~~~~~~~~~~~~
+        scratch_space = None
+        batch_size, num_heads, seq_len_qv, d_head = q.shape
+        mask_scratch_space = torch.zeros((batch_size, num_heads, seq_len_qv, seq_len_qv), device=q.device, dtype=torch.float32)
+        print(f"{mask_scratch_space.shape=}")
+        
+        _attn_fwd[grid](
+            q, k, v, sm_scale, M, o, mask_scratch_space,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            q.shape[0],  # Z
+            q.shape[1], # H
+            N_CTX=q.shape[2],
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_DMODEL=Lk,
+            STAGE=stage,
+            is_causal=causal,
+            bias_choice = bias_choice,
+            debug_mask = debug_mask,
+            # meta params
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+        ctx.save_for_backward(q, k, v, o, M)
+        ctx.grid = grid
+        ctx.sm_scale = sm_scale
+        ctx.BLOCK_DMODEL = Lk
+        ctx.causal = causal
+
+        return o, mask_scratch_space
+    
+    @staticmethod
+    def backward(ctx, do):
+        capability = torch.cuda.get_device_capability()
+        MMA_V3 = capability[0] >= 9
+        BLOCK = 128
+        q, k, v, o, L = ctx.saved_tensors
+        sequence_parallel = ctx.sequence_parallel
+        seq_len_kv = k.shape[2]
+        do = do.contiguous()
+        if sequence_parallel:
+            replicas = cdiv(seq_len_kv, BLOCK)
+            new_dq_shape = (replicas,) + q.shape
+            dq = torch.zeros(new_dq_shape, device=q.device, dtype=q.dtype)
+        else:
+            dq = torch.zeros_like(q, dtype=q.dtype)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        delta = torch.empty_like(L)
+        _bwd_preprocess[(cdiv(q.shape[2], BLOCK) * ctx.grid[1], )](
+            o, do,
+            delta,
+            BLOCK_M=BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
+        )
+        _bwd_kernel[(ctx.grid[1], cdiv(seq_len_kv, BLOCK) if sequence_parallel else 1)](
+            q, k, v, ctx.sm_scale,
+            o, do,
+            dq, dk, dv,
+            L,
+            delta,
+            o.numel(), q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            q.shape[0], q.shape[1], q.shape[2],
+            BLOCK_M=BLOCK, BLOCK_N=BLOCK,
+            BLOCK_DMODEL=ctx.BLOCK_DMODEL,
+            SEQUENCE_PARALLEL=sequence_parallel,
+            CAUSAL=ctx.causal,
+            MMA_V3=MMA_V3,
+            num_warps=8,
+            num_stages=1,
+        )
+
+        if len(dq.shape) == 5:
+            dq = dq.sum(dim=0)
+        return dq, dk, dv, None, None, None
+
+'''class _attention(torch.autograd.Function):
+
+    @staticmethod
+    
+    def forward(ctx, q, k, v, causal, sm_scale, bias_choice: BiasMode = BiasMode.none, debug_mask: bool = True,):
+        # only support for Ampere now
+        capability = torch.cuda.get_device_capability()
+        if capability[0] < 8:
+            raise RuntimeError("Flash attention currently only supported for compute capability >= 80")
+        
+        print(f"{debug_mask=}")
+        assert debug_mask, f"not debugging? "
+        batch_size, num_heads, seq_len_qv, d_head = q.shape
+        BLOCK_M = 128
+        BLOCK_N = 64
+        # shape constraints
+        Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+        assert Lq == Lk and Lk == Lv
+        assert Lk in {16, 32, 64, 128}
+        o = torch.empty_like(q)
+        grid = (cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+        L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+
+        scratch_space = None
+        if debug_mask:
+            scratch_space = torch.ones((batch_size, num_heads, seq_len_qv, seq_len_qv), device=q.device, dtype=torch.float32)
+        
+        num_warps = 4 if Lk <= 64 else 8
+
+        _fwd_kernel[grid](
+            q, k, v, sm_scale,
+            L,
+            o,
+            scratch_space,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            q.shape[0], q.shape[1], q.shape[2],
+            q.shape[0] * q.shape[1] * q.shape[2],
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
+            IS_CAUSAL=causal,
+            BIAS_CHOICE=bias_choice.value,
+            DEBUG_MASK=debug_mask,
+            num_warps=num_warps,
+            num_stages=4)
+
+        ctx.save_for_backward(q, k, v, o, L)
+        ctx.grid = grid
+        ctx.sm_scale = sm_scale
+        ctx.BLOCK_DMODEL = Lk
+        ctx.causal = causal
+        ctx.sequence_parallel = sequence_parallel
+        return o, scratch_space
+'''
 
 @jit
 def _bwd_preprocess(
@@ -259,7 +598,7 @@ def _bwd_kernel_one_col_block(
         # recompute p = softmax(qk, dim=-1).T
         # NOTE: `do` is pre-divided by `l`; no normalization here
         if CAUSAL:
-            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
+            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), -1.0e6)
         else:
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
@@ -391,6 +730,7 @@ def _bwd_kernel(
         order=(1, 0)
     )
 
+
     num_block_n = tl.cdiv(N_CTX, BLOCK_N)
     if not SEQUENCE_PARALLEL:
         for start_n in range(0, num_block_n):
@@ -432,106 +772,7 @@ def _bwd_kernel(
             CAUSAL=CAUSAL,
             MMA_V3=MMA_V3
         )
-
-
-class _attention(torch.autograd.Function):
-
-    @staticmethod
-    
-    def forward(ctx, q, k, v, causal, sm_scale, bias_choice: BiasMode = BiasMode.none, debug_mask: bool = False, sequence_parallel=False):
-        # only support for Ampere now
-        capability = torch.cuda.get_device_capability()
-        if capability[0] < 8:
-            raise RuntimeError("Flash attention currently only supported for compute capability >= 80")
-        
-        batch_size, num_heads, seq_len_qv, d_head = q.shape
-        BLOCK_M = 128
-        BLOCK_N = 64
-        # shape constraints
-        Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
-        assert Lq == Lk and Lk == Lv
-        assert Lk in {16, 32, 64, 128}
-        o = torch.empty_like(q)
-        grid = (cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
-        L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-
-        scratch_space = None
-        if debug_mask:
-            scratch_space = torch.zeros((batch_size, num_heads, seq_len_qv, seq_len_qv), device=q.device, dtype=torch.float32)
-        
-        num_warps = 4 if Lk <= 64 else 8
-
-        _fwd_kernel[grid](
-            q, k, v, sm_scale,
-            L,
-            o,
-            scratch_space,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
-            q.shape[0] * q.shape[1] * q.shape[2],
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
-            IS_CAUSAL=causal,
-            BIAS_CHOICE=bias_choice.value,
-            DEBUG_MASK=debug_mask,
-            num_warps=num_warps,
-            num_stages=4)
-
-        ctx.save_for_backward(q, k, v, o, L)
-        ctx.grid = grid
-        ctx.sm_scale = sm_scale
-        ctx.BLOCK_DMODEL = Lk
-        ctx.causal = causal
-        ctx.sequence_parallel = sequence_parallel
-        return o, scratch_space
-
-    @staticmethod
-    def backward(ctx, do):
-        capability = torch.cuda.get_device_capability()
-        MMA_V3 = capability[0] >= 9
-        BLOCK = 128
-        q, k, v, o, L = ctx.saved_tensors
-        sequence_parallel = ctx.sequence_parallel
-        seq_len_kv = k.shape[2]
-        do = do.contiguous()
-        if sequence_parallel:
-            replicas = cdiv(seq_len_kv, BLOCK)
-            new_dq_shape = (replicas,) + q.shape
-            dq = torch.zeros(new_dq_shape, device=q.device, dtype=q.dtype)
-        else:
-            dq = torch.zeros_like(q, dtype=q.dtype)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
-        delta = torch.empty_like(L)
-        _bwd_preprocess[(cdiv(q.shape[2], BLOCK) * ctx.grid[1], )](
-            o, do,
-            delta,
-            BLOCK_M=BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
-        )
-        _bwd_kernel[(ctx.grid[1], cdiv(seq_len_kv, BLOCK) if sequence_parallel else 1)](
-            q, k, v, ctx.sm_scale,
-            o, do,
-            dq, dk, dv,
-            L,
-            delta,
-            o.numel(), q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
-            BLOCK_M=BLOCK, BLOCK_N=BLOCK,
-            BLOCK_DMODEL=ctx.BLOCK_DMODEL,
-            SEQUENCE_PARALLEL=sequence_parallel,
-            CAUSAL=ctx.causal,
-            MMA_V3=MMA_V3,
-            num_warps=8,
-            num_stages=1,
-        )
-
-        if len(dq.shape) == 5:
-            dq = dq.sum(dim=0)
-        return dq, dk, dv, None, None, None
+  
 
 
 latest_attention = _attention.apply
