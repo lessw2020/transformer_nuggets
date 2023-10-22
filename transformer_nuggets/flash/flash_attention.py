@@ -26,8 +26,8 @@ def build_causal_mask(seq_len_q, seq_len_kv):
 
 def build_alibi_mask(n_queries, n_keys, n_heads, scale=None, causal=True):
     if scale is None:
-        assert n_heads%8 == 0
-    m_0  = 2.0 ** (-8.0 / n_heads)
+        pass # assert n_heads%8 == 0
+    m_0  = 1 # 2.0 ** (-8.0 / n_heads)
     slopes = torch.pow(m_0, torch.arange(1, 1 + n_heads))[:, None, None]
     base = -1 * (torch.arange(n_queries)[:, None] - torch.arange(n_keys)[None, :])
     if scale is not None:

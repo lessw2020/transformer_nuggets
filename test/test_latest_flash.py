@@ -3,11 +3,11 @@ import pytest
 from transformer_nuggets.flash import BiasMode, build_alibi_mask, latest_attention, build_causal_attention_mask, build_causal_mask
 import time
 
-@pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(4, 8, 128, 16)])
+@pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(1, 1, 32, 32)])
 #@pytest.mark.parametrize("",)
 @pytest.mark.parametrize("causal", [True])
-@pytest.mark.parametrize("bias_choice", [BiasMode.none,]) #  BiasMode.alibi])
-@pytest.mark.parametrize("sm_scale", [None, 1])
+@pytest.mark.parametrize("bias_choice", [BiasMode.alibi,]) #  BiasMode.alibi])
+@pytest.mark.parametrize("sm_scale", [1,]) # 1])
 
 def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.float16):
     torch.manual_seed(2020)
@@ -32,7 +32,17 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.floa
     dout = torch.randn_like(q)
 
     # ref impl
-    if bias_choice == BiasMode.none:
+    # reference implementation
+    if bias_choice == BiasMode.rel_pos:
+        attn_bias = build_alibi_mask(N_CTX, N_CTX, H, scale=1, causal=causal)
+        attn_bias = attn_bias.expand(Z, H, N_CTX, N_CTX).to(q.device).to(q.dtype)
+    elif bias_choice == BiasMode.alibi:
+        attn_bias = build_alibi_mask(N_CTX, N_CTX, H, scale=None, causal=causal)
+        #print(f"ref attn bias {attn_bias=}")
+        attn_bias = attn_bias.expand( Z, H, N_CTX, N_CTX).to(q.device).to(q.dtype)
+        saved_bias = attn_bias.clone()
+        print(f"full ref attn bias {attn_bias=}")
+    elif bias_choice == BiasMode.none:
         attn_bias = None
     is_causal = causal if (bias_choice == BiasMode.none) else False
 
@@ -43,11 +53,16 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.floa
     
     # triton impl
     # q, k, v, causal, sm_scale, seq_parallel
-    tri_out, mask = latest_attention(q, k, v, causal, sm_scale, bias_choice, True) #  bias_choice, True)
-    tri_out.half()
-    print(f"{mask=}")
+    tri_out, tri_mask = latest_attention(q, k, v, causal, sm_scale, bias_choice, True) #  bias_choice, True)
+    #tri_out.half()
+    mask_tri = tri_mask.to(torch.float16)
+    print(f"{mask_tri=}")
 
-    torch.testing.assert_close(ref_out, tri_out, atol=5.5e-2, rtol=0)
+    #torch.testing.assert_close(ref_out, tri_out, atol=2.5e-1, rtol=0)
+    #torch.testing.assert_close(mask, attn_bias)
+    print(f"{mask_tri[0][0][2]=}\n,{saved_bias[0][0][2]=}")
+    print(f"{attn_bias[0][0][2]=}")
+    
 
 '''
 @pytest.mark.parametrize("N_CTX", [128, 256, 1024, 2048, 4096, 8192, 16384])

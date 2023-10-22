@@ -47,11 +47,19 @@ class BiasMode(enum.Enum):
 
 @triton.jit
 def alibi_attention_triton(cur, m, n, head_num: int, num_heads: int):
-    alibi_scale = tl.math.exp2(-((head_num + 1) * 8.0 / num_heads))
-    bias = n - m
-    tl.device_print("bias ", bias)
-    tl.device_print("alibi_heads ", alibi_scale)
-    cur = cur + (alibi_scale * bias)
+    alibi_scale = 1 # tl.math.exp2(-((head_num + 1) * 8.0 / num_heads))
+    #tl.device_print("alibi scale ", alibi_scale)
+    bias = n-m
+    tl.device_print("m, n, bias ", m, n, bias)
+    #breakpoint()
+    #tl.device_print("m, n, head_num ",m, n, head_num)
+    alibi_mask = alibi_scale * bias
+    #breakpoint()
+    #tl.device_print("alibi mask ", alibi_mask)
+    #tl.device_print("m ", m)
+    #tl.device_print("alibi_heads ", alibi_scale)
+    cur = cur + alibi_mask
+    #breakpoint()
     return cur
 
 
@@ -130,8 +138,11 @@ def _fwd_kernel(
         v = tl.load(V_block_ptr)
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        tl.device_print("block_m, block_n ", BLOCK_M, BLOCK_N)
         if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+            tl.device_print("qk causal ", qk)
+            qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, -1.0e6)
+            tl.device_print("qk after where ", qk)
         qk += tl.dot(q, k, allow_tf32=True)
         # ~~~~~~~~~~~~~ Mask work ~~~~~~~~~~~~~~ 
         if BIAS_CHOICE == BiasMode.alibi:
@@ -144,7 +155,7 @@ def _fwd_kernel(
         if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
             mask = qk - tl.dot(q,k)
             if IS_CAUSAL:
-                mask = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), mask, float("-inf"))                                    
+                mask = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), mask, -1.0e6)                                    
             tl.store(mask_block_ptr, mask)
         # ~~~~~~~~~~  End Mask work ~~~~~~~~~~~~
         
