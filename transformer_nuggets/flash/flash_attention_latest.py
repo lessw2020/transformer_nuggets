@@ -35,7 +35,7 @@ def build_causal_attention_mask(seq_len_q: int, seq_len_kv: int, num_heads: int=
 
 
 @triton.jit
-def rel_attention_triton(cur, m, n, head_num, num_heads):
+def rel_pos_attention_triton(cur, m, n, head_num, num_heads):
     bias = n - m
     cur = cur + bias
     return cur
@@ -49,6 +49,8 @@ class BiasMode(enum.Enum):
 def alibi_attention_triton(cur, m, n, head_num: int, num_heads: int):
     alibi_scale = tl.math.exp2(-((head_num + 1) * 8.0 / num_heads))
     bias = n - m
+    tl.device_print("bias ", bias)
+    tl.device_print("alibi_heads ", alibi_scale)
     cur = cur + (alibi_scale * bias)
     return cur
 
@@ -57,7 +59,7 @@ def alibi_attention_triton(cur, m, n, head_num: int, num_heads: int):
 def _fwd_kernel(
     Q, K, V, sm_scale,
     L,
-    Out,
+    Out, mask_scratch_space, 
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
@@ -67,6 +69,8 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    BIAS_CHOICE: tl.constexpr, 
+    DEBUG_MASK: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -89,6 +93,16 @@ def _fwd_kernel(
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0)
     )
+
+    if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
+        mask_block_ptr = tl.make_block_ptr(
+            base = mask_scratch_space + off_hz * N_CTX *N_CTX,
+            shape = (N_CTX, N_CTX),
+            strides = (N_CTX,1),
+            offsets=(start_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_N),
+            order = (1,0),
+        )
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -119,6 +133,21 @@ def _fwd_kernel(
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         qk += tl.dot(q, k, allow_tf32=True)
+        # ~~~~~~~~~~~~~ Mask work ~~~~~~~~~~~~~~ 
+        if BIAS_CHOICE == BiasMode.alibi:
+            qk = alibi_attention_triton(qk, offs_m[:,None], (start_n + offs_n[None,:]),
+                                        off_hz % H, H)
+        elif BIAS_CHOICE == BiasMode.rel_pos:
+            qk = rel_pos_attention_triton(qk, offs_m[:,None], (start_n + offs_n[None,:]),
+                                          off_hz % H, H)
+        # ---- debug mask - remove for prod
+        if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
+            mask = qk - tl.dot(q,k)
+            if IS_CAUSAL:
+                mask = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), mask, float("-inf"))                                    
+            tl.store(mask_block_ptr, mask)
+        # ~~~~~~~~~~  End Mask work ~~~~~~~~~~~~
+        
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
         alpha = tl.math.exp2(m_i - m_i_new)
