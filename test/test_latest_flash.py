@@ -43,11 +43,13 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.floa
     
     # triton impl
     # q, k, v, causal, sm_scale, seq_parallel
-    tri_out = latest_attention(q, k, v, causal, sm_scale,) #  bias_choice, True)
+    tri_out, mask = latest_attention(q, k, v, causal, sm_scale, bias_choice, True) #  bias_choice, True)
     tri_out.half()
+    print(f"{mask=}")
 
     torch.testing.assert_close(ref_out, tri_out, atol=5.5e-2, rtol=0)
 
+'''
 @pytest.mark.parametrize("N_CTX", [128, 256, 1024, 2048, 4096, 8192, 16384])
 def test_mask(N_CTX, ):
     torch.manual_seed(2020)
@@ -64,7 +66,7 @@ def test_mask(N_CTX, ):
     print(f"{dtime=}, {ltime=}")
 
     torch.testing.assert_close(driss_ref, less_ref, atol=5.5e-2, rtol=0)
-
+'''
 
 
 

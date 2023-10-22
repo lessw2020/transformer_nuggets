@@ -474,7 +474,7 @@ class _attention(torch.autograd.Function):
         ctx.BLOCK_DMODEL = Lk
         ctx.causal = causal
         ctx.sequence_parallel = sequence_parallel
-        return o
+        return o, scratch_space
 
     @staticmethod
     def backward(ctx, do):
