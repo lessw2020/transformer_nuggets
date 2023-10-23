@@ -3,7 +3,7 @@ import pytest
 from transformer_nuggets.flash import BiasMode, build_alibi_mask, latest_attention, build_causal_attention_mask, build_causal_mask
 import time
 
-@pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(1, 1, 128, 64)])
+@pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(1, 1, 256, 32)])
 #@pytest.mark.parametrize("",)
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("bias_choice", [BiasMode.alibi,]) #  BiasMode.alibi])
@@ -63,12 +63,18 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.floa
     #for row in tri_mask[0][0]:
     #    print(f"{row=}\n")
         
-    
-    print(f"{attn_bias[0][0][2]=}")
-    print(f"{tri_mask[0][0][2]=}")
-    print("3 mask")
+    print(f"{tri_mask.shape=}")
+    print(f"{attn_bias.shape=}")
+
+    print("N_CTX mask")
+    print(f"{attn_bias[0][0][N_CTX-1]=}")
+    print(f"{tri_mask[0][0][N_CTX-1]=}")
+    print(f" 003 mask")
     print(f"{attn_bias[0][0][3]=}")
     print(f"{tri_mask[0][0][3]=}")
+    #print("32 mask")
+    #print(f"{attn_bias[0][0][32]=}")
+    #print(f"{tri_mask[0][0][32]=}")
     
 
 '''

@@ -220,6 +220,9 @@ def _attn_fwd_inner(
         lo, hi = 0, N_CTX
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    #if STAGE==1:
+    #    mask_block_ptr = tl.advance(mask_block_ptr, (0,lo))
+
     # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -233,16 +236,22 @@ def _attn_fwd_inner(
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
             # ~~~~~~~~~~ mask work ~~~~~~~~~~~~~
+            # atm let's verify the pure alibi bias mask (no slopes, no qk) returned is correct...
             res = alibi_attention_triton(qk, offs_m[:, None], (start_n + offs_n[None, :]), off_h, H)
             #mask = qk - tl.dot(q,k)
-            #mask -= m_ij[:, None]
+            #mask -= m_ij[:, None] 
             mask = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), res, -1.0e6,)
+            #tl.device_print("stage 2 mask store")
             tl.store(mask_block_ptr, mask)
-            # ~~~~~~~~~ end mask work ~~~~~~~~~~~
+            
 
         else:
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
             qk = qk * qk_scale - m_ij[:, None]
+            
+            
+            # ~~~~~~~~~ end mask work ~~~~~~~~~~~
+            
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
         # -- update m_i and l_i
@@ -258,9 +267,10 @@ def _attn_fwd_inner(
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         # ~~~~~~~~~ mask advance ~~~~~~~ 
-        if STAGE ==2:
-            mask_block_ptr = tl.advance(mask_block_ptr, (0, BLOCK_N))
+        #if STAGE ==2:
+        mask_block_ptr = tl.advance(mask_block_ptr, (0, BLOCK_N))
 
+        
     return acc, l_i, m_i
 
 @triton.jit
