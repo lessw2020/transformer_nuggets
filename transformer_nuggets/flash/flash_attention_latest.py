@@ -221,7 +221,7 @@ def _attn_fwd_inner(
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
     #if STAGE==1:
-    #    mask_block_ptr = tl.advance(mask_block_ptr, (0,lo))
+    #mask_block_ptr = tl.advance(mask_block_ptr, (0,lo))
 
     # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
@@ -335,7 +335,7 @@ def _attn_fwd(
     mask_block_ptr = tl.make_block_ptr(
         base = mask_scratch_space + off_hz*N_CTX*N_CTX,
         shape=(N_CTX, N_CTX),
-        strides=(N_CTX, 1),
+        strides=(N_CTX, 1), # N_CTX, 1),
         offsets=(start_m * BLOCK_M, 0),
         block_shape=(BLOCK_M, BLOCK_N),
         order=(1, 0)
@@ -364,7 +364,7 @@ def _attn_fwd(
         )
     # stage 2: on-band
     if STAGE & 2:
-        # barrier makes it easier for compielr to schedule the
+        # barrier makes it easier for compiler to schedule the
         # two loops independently
         tl.debug_barrier()
         acc, l_i, m_i = _attn_fwd_inner(
@@ -407,7 +407,7 @@ class _attention(torch.autograd.Function):
         mask_scratch_space = torch.zeros((batch_size, num_heads, seq_len_qv, seq_len_qv), device=q.device, dtype=torch.float32)
         print(f"{mask_scratch_space.shape=}")
         
-        _attn_fwd[grid](
+        k = _attn_fwd[grid](
             q, k, v, sm_scale, M, o, mask_scratch_space,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -428,7 +428,10 @@ class _attention(torch.autograd.Function):
             num_stages=num_stages,
         )
 
-        ctx.save_for_backward(q, k, v, o, M)
+        print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory used\n")
+
+
+        # ctx.save_for_backward(q, k, v, o, M)
         ctx.grid = grid
         ctx.sm_scale = sm_scale
         ctx.BLOCK_DMODEL = Lk

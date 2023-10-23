@@ -67,11 +67,15 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.floa
     print(f"{attn_bias.shape=}")
 
     print("N_CTX mask")
-    print(f"{attn_bias[0][0][N_CTX-1]=}")
+    # print(f"{attn_bias[0][0][N_CTX-1]=}")
     print(f"{tri_mask[0][0][N_CTX-1]=}")
     print(f" 003 mask")
-    print(f"{attn_bias[0][0][3]=}")
+    # print(f"{attn_bias[0][0][3]=}")
     print(f"{tri_mask[0][0][3]=}")
+    print(f"25 mask")
+    print(f"{tri_mask[0][0][25]=}")
+
+    
     #print("32 mask")
     #print(f"{attn_bias[0][0][32]=}")
     #print(f"{tri_mask[0][0][32]=}")
