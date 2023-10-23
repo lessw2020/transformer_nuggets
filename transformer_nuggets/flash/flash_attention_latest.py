@@ -335,8 +335,8 @@ def _attn_fwd(
     mask_block_ptr = tl.make_block_ptr(
         base = mask_scratch_space + off_hz*N_CTX*N_CTX,
         shape=(N_CTX, N_CTX),
-        strides=(N_CTX, 1), # N_CTX, 1),
-        offsets=(start_m * BLOCK_M, 0),
+        strides=(N_CTX, 1), 
+        offsets=(0,0),
         block_shape=(BLOCK_M, BLOCK_N),
         order=(1, 0)
     )
@@ -429,7 +429,8 @@ class _attention(torch.autograd.Function):
         )
 
         print(f"{k.n_regs} registers used, {k.n_spills} spills, {k.shared/1000} kB shared memory used\n")
-
+        if k.n_spills > 0:
+            print(f"~~~~~~ WARNING - Register Spilling! ~~~~~~~~~~~`")
 
         # ctx.save_for_backward(q, k, v, o, M)
         ctx.grid = grid
